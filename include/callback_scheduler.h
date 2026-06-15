@@ -52,6 +52,7 @@ private:
     using Queue = std::priority_queue<std::shared_ptr<Task>,
                                       std::vector<std::shared_ptr<Task>>,
                                       Compare>;
+
     std::mutex mutex_;
     std::condition_variable cv_;
     Queue queue_;
