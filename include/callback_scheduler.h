@@ -18,16 +18,39 @@ class CallbackScheduler {
 public:
     using TaskId = std::uint64_t;
 
-    CallbackScheduler();
-    ~CallbackScheduler();
+    CallbackScheduler() : stop_(false) {
+        worker_ = std::thread(&CallbackScheduler::WorkerLoop, this);
+    }
 
-    // Запланировать вызов callback в момент when (или сразу, если when уже прошло)
-    TaskId Schedule(std::function<void()> callback, TimePoint when);
+    ~CallbackScheduler() {
+        stop_.store(true);
+        cv_.notify_all();
+        if (worker_.joinable())
+            worker_.join();
+    }
 
-    // Отменить задачу по идентификатору. true, если задача была отменена.
-    bool Cancel(TaskId id);
+    TaskId Schedule(std::function<void()> callback, TimePoint when) {
+        TaskId id = nextId_.fetch_add(1);
+        auto task = std::make_shared<Task>(std::move(callback), when, id);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            tasks_.emplace(id, task);
+            queue_.push(task);
+        }
+        cv_.notify_one();
+        return id;
+    }
 
-    // Запрет копирования и перемещения
+    bool Cancel(TaskId id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = tasks_.find(id);
+        if (it != tasks_.end()) {
+            tasks_.erase(it);
+            return true;
+        }
+        return false;
+    }
+
     CallbackScheduler(const CallbackScheduler&) = delete;
     CallbackScheduler& operator=(const CallbackScheduler&) = delete;
 
@@ -36,10 +59,9 @@ private:
         std::function<void()> callback;
         TimePoint when;
         TaskId id;
-        std::atomic<bool> cancelled;
 
         Task(std::function<void()> cb, TimePoint t, TaskId i)
-            : callback(std::move(cb)), when(t), id(i), cancelled(false) {}
+            : callback(std::move(cb)), when(t), id(i) {}
     };
 
     struct Compare {
@@ -59,7 +81,37 @@ private:
     std::unordered_map<TaskId, std::shared_ptr<Task>> tasks_;
     std::atomic<TaskId> nextId_{1};
     std::thread worker_;
-    std::atomic<bool> stop_{false};
+    std::atomic<bool> stop_;
 
-    void WorkerLoop();
+    void WorkerLoop() {
+        while (!stop_.load()) {
+            std::unique_lock<std::mutex> lock(mutex_);
+            cv_.wait(lock, [this] {
+                return !queue_.empty() || stop_.load();
+            });
+
+            if (stop_.load())
+                break; // не выполняем оставшиеся задачи при остановке
+
+            auto task = queue_.top();
+            queue_.pop();
+
+            auto it = tasks_.find(task->id);
+            if (it == tasks_.end()) {
+                // задача отменена — пропускаем
+                continue;
+            }
+
+            // удаляем из tasks_, чтобы предотвратить повторное выполнение
+            // и сделать невозможной отмену уже запущенной задачи
+            tasks_.erase(it);
+
+            lock.unlock(); // отпускаем мьютекс перед вызовом callback
+
+            // выполняем задачу
+            task->callback();
+
+            // после завершения callback задача больше не нужна
+        }
+    }
 };
