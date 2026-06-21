@@ -1,117 +1,92 @@
-#pragma once
+#include "callback_scheduler.h"
+#include <iostream>
+#include <stdexcept>
 
-#include <chrono>
-#include <functional>
-#include <cstdint>
-#include <memory>
-#include <mutex>
-#include <condition_variable>
-#include <thread>
-#include <queue>
-#include <vector>
-#include <unordered_map>
-#include <atomic>
+CallbackScheduler::CallbackScheduler()
+    : stop_(false)
+{
+    worker_ = std::thread(&CallbackScheduler::WorkerLoop, this);
+}
 
-using TimePoint = std::chrono::time_point<std::chrono::system_clock>;
+CallbackScheduler::~CallbackScheduler() {
+    stop_.store(true);          // атомарная установка, мьютекс не нужен
+    cv_.notify_all();
+    if (worker_.joinable())
+        worker_.join();
+}
 
-class CallbackScheduler {
-public:
-    using TaskId = std::uint64_t;
+CallbackScheduler::TaskId CallbackScheduler::Schedule(
+    std::function<void()> callback, TimePoint when)
+{
+    TaskId id = nextId_.fetch_add(1);   // атомарно, вне мьютекса
+    auto task = std::make_shared<Task>(std::move(callback), when, id);
 
-    CallbackScheduler() : stop_(false) {
-        worker_ = std::thread(&CallbackScheduler::WorkerLoop, this);
-    }
-
-    ~CallbackScheduler() {
-        stop_.store(true);
-        cv_.notify_all();
-        if (worker_.joinable())
-            worker_.join();
-    }
-
-    TaskId Schedule(std::function<void()> callback, TimePoint when) {
-        TaskId id = nextId_.fetch_add(1);
-        auto task = std::make_shared<Task>(std::move(callback), when, id);
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            tasks_.emplace(id, task);
-            queue_.push(task);
-        }
-        cv_.notify_one();
-        return id;
-    }
-
-    bool Cancel(TaskId id) {
+    {
         std::lock_guard<std::mutex> lock(mutex_);
-        auto it = tasks_.find(id);
-        if (it != tasks_.end()) {
-            tasks_.erase(it);
-            return true;
-        }
-        return false;
+        activeIds_.insert(id);
+        queue_.push(task);
+        // Всегда будим воркер — проверки излишни
+        cv_.notify_one();
     }
+    return id;
+}
 
-    CallbackScheduler(const CallbackScheduler&) = delete;
-    CallbackScheduler& operator=(const CallbackScheduler&) = delete;
+bool CallbackScheduler::Cancel(TaskId id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = activeIds_.find(id);
+    if (it != activeIds_.end()) {
+        activeIds_.erase(it);
+        return true;
+    }
+    return false;
+}
 
-private:
-    struct Task {
-        std::function<void()> callback;
-        TimePoint when;
-        TaskId id;
+void CallbackScheduler::WorkerLoop() {
+    while (!stop_.load()) {
+        std::unique_lock<std::mutex> lock(mutex_);
 
-        Task(std::function<void()> cb, TimePoint t, TaskId i)
-            : callback(std::move(cb)), when(t), id(i) {}
-    };
+        // Ждём, пока появится задача или будет сигнал остановки
+        cv_.wait(lock, [this] {
+            return !queue_.empty() || stop_.load();
+        });
 
-    struct Compare {
-        bool operator()(const std::shared_ptr<Task>& a,
-                        const std::shared_ptr<Task>& b) const {
-            return a->when > b->when; // минимальное время — на вершине
-        }
-    };
+        if (stop_.load())
+            break;
 
-    using Queue = std::priority_queue<std::shared_ptr<Task>,
-                                      std::vector<std::shared_ptr<Task>>,
-                                      Compare>;
-
-    std::mutex mutex_;
-    std::condition_variable cv_;
-    Queue queue_;
-    std::unordered_map<TaskId, std::shared_ptr<Task>> tasks_;
-    std::atomic<TaskId> nextId_{1};
-    std::thread worker_;
-    std::atomic<bool> stop_;
-
-    void WorkerLoop() {
-        while (!stop_.load()) {
-            std::unique_lock<std::mutex> lock(mutex_);
-            cv_.wait(lock, [this] {
-                return !queue_.empty() || stop_.load();
+        auto now = std::chrono::system_clock::now();
+        auto top = queue_.top();
+        if (top->when > now) {
+            // Ожидаем до времени ближайшей задачи или до появления новой
+            cv_.wait_until(lock, top->when, [this] {
+                return stop_.load() || (!queue_.empty() &&
+                       queue_.top()->when <= std::chrono::system_clock::now());
             });
-
-            if (stop_.load())
-                break; // не выполняем оставшиеся задачи при остановке
-
-            auto task = queue_.top();
-            queue_.pop();
-
-            auto it = tasks_.find(task->id);
-            if (it == tasks_.end()) {
-                // задача отменена — пропускаем
-                continue;
-            }
-
-            // удаляем из tasks_, чтобы предотвратить повторное выполнение
-            // и сделать невозможной отмену уже запущенной задачи
-            tasks_.erase(it);
-
-            lock.unlock(); // отпускаем мьютекс перед вызовом callback
-
-            // выполняем задачу
-            task->callback();
-
-            // после завершения callback задача больше не нужна
+            continue;   // после ожидания возвращаемся в начало цикла
         }
+
+        // Время наступило – извлекаем задачу
+        auto task = queue_.top();
+        queue_.pop();
+
+        // Проверяем, активна ли задача (не отменена)
+        auto it = activeIds_.find(task->id);
+        if (it == activeIds_.end()) {
+            continue;   // отменена – пропускаем
+        }
+        activeIds_.erase(it);   // удаляем из активных, чтобы нельзя было отменить после старта
+
+        // Выполняем колбэк без удержания мьютекса
+        lock.unlock();
+        try {
+            task->callback();
+        } catch (const std::exception& e) {
+            std::cerr << "Exception in callback (id=" << task->id
+                      << "): " << e.what() << std::endl;
+        } catch (...) {
+            std::cerr << "Unknown exception in callback (id="
+                      << task->id << ")" << std::endl;
+        }
+        // lock автоматически перезахватится при следующей итерации (если нужно),
+        // поэтому явный lock.unlock() в конце не требуется.
     }
-};
+}
