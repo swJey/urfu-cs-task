@@ -1,94 +1,117 @@
-#include "callback_scheduler.h"
-#include <iostream>
-#include <stdexcept>
+#pragma once
 
-CallbackScheduler::CallbackScheduler()
-    : worker_(&CallbackScheduler::WorkerLoop, this) {}
+#include <chrono>
+#include <functional>
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <condition_variable>
+#include <thread>
+#include <queue>
+#include <vector>
+#include <unordered_map>
+#include <atomic>
 
-CallbackScheduler::~CallbackScheduler() {
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        stop_ = true;
+using TimePoint = std::chrono::time_point<std::chrono::system_clock>;
+
+class CallbackScheduler {
+public:
+    using TaskId = std::uint64_t;
+
+    CallbackScheduler() : stop_(false) {
+        worker_ = std::thread(&CallbackScheduler::WorkerLoop, this);
     }
-    cv_.notify_one();
-    if (worker_.joinable()) {
-        worker_.join();
+
+    ~CallbackScheduler() {
+        stop_.store(true);
+        cv_.notify_all();
+        if (worker_.joinable())
+            worker_.join();
     }
-}
 
-CallbackScheduler::TaskId CallbackScheduler::Schedule(
-    std::function<void()> callback, TimePoint when)
-{
-    std::shared_ptr<Task> task;
-    TaskId id;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        id = nextId_++;
-        task = std::make_shared<Task>(std::move(callback), when, id);
-        tasks_[id] = task;
-        bool wasEmpty = queue_.empty();
-        TimePoint topTime = wasEmpty ? TimePoint::max() : queue_.top()->when;
-        queue_.push(task);
-
-        // Будим воркер, если очередь была пуста или новая задача раньше текущей ближайшей
-        if (wasEmpty || when < topTime) {
-            cv_.notify_one();
+    TaskId Schedule(std::function<void()> callback, TimePoint when) {
+        TaskId id = nextId_.fetch_add(1);
+        auto task = std::make_shared<Task>(std::move(callback), when, id);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            tasks_.emplace(id, task);
+            queue_.push(task);
         }
+        cv_.notify_one();
+        return id;
     }
-    return id;
-}
 
-bool CallbackScheduler::Cancel(TaskId id) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto it = tasks_.find(id);
-    if (it != tasks_.end() && !it->second->cancelled) {
-        it->second->cancelled = true;
-        tasks_.erase(it);
-        return true;
-    }
-    return false;
-}
-
-void CallbackScheduler::WorkerLoop() {
-    while (true) {
-        std::unique_lock<std::mutex> lock(mutex_);
-
-        // Ждём появления хотя бы одной задачи или сигнала остановки
-        while (queue_.empty() && !stop_) {
-            cv_.wait(lock);
+    bool Cancel(TaskId id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = tasks_.find(id);
+        if (it != tasks_.end()) {
+            tasks_.erase(it);
+            return true;
         }
-        if (stop_) break;
+        return false;
+    }
 
-        auto now = std::chrono::system_clock::now();
-        auto top = queue_.top();
-        if (top->when > now) {
-            // Ожидаем до времени ближайшей задачи или до пробуждения
-            cv_.wait_until(lock, top->when, [this] {
-                return stop_ || (!queue_.empty() &&
-                       queue_.top()->when <= std::chrono::system_clock::now());
+    CallbackScheduler(const CallbackScheduler&) = delete;
+    CallbackScheduler& operator=(const CallbackScheduler&) = delete;
+
+private:
+    struct Task {
+        std::function<void()> callback;
+        TimePoint when;
+        TaskId id;
+
+        Task(std::function<void()> cb, TimePoint t, TaskId i)
+            : callback(std::move(cb)), when(t), id(i) {}
+    };
+
+    struct Compare {
+        bool operator()(const std::shared_ptr<Task>& a,
+                        const std::shared_ptr<Task>& b) const {
+            return a->when > b->when; // минимальное время — на вершине
+        }
+    };
+
+    using Queue = std::priority_queue<std::shared_ptr<Task>,
+                                      std::vector<std::shared_ptr<Task>>,
+                                      Compare>;
+
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    Queue queue_;
+    std::unordered_map<TaskId, std::shared_ptr<Task>> tasks_;
+    std::atomic<TaskId> nextId_{1};
+    std::thread worker_;
+    std::atomic<bool> stop_;
+
+    void WorkerLoop() {
+        while (!stop_.load()) {
+            std::unique_lock<std::mutex> lock(mutex_);
+            cv_.wait(lock, [this] {
+                return !queue_.empty() || stop_.load();
             });
-            continue;
-        }
 
-        // Время задачи наступило
-        auto task = queue_.top();
-        queue_.pop();
+            if (stop_.load())
+                break; // не выполняем оставшиеся задачи при остановке
 
-        if (task->cancelled) {
-            continue; // отменённые задачи пропускаем
-        }
+            auto task = queue_.top();
+            queue_.pop();
 
-        // Выполняем колбэк без удержания мьютекса
-        lock.unlock();
-        try {
+            auto it = tasks_.find(task->id);
+            if (it == tasks_.end()) {
+                // задача отменена — пропускаем
+                continue;
+            }
+
+            // удаляем из tasks_, чтобы предотвратить повторное выполнение
+            // и сделать невозможной отмену уже запущенной задачи
+            tasks_.erase(it);
+
+            lock.unlock(); // отпускаем мьютекс перед вызовом callback
+
+            // выполняем задачу
             task->callback();
-        } catch (const std::exception& e) {
-            std::cerr << "Exception in callback (id=" << task->id
-                      << "): " << e.what() << std::endl;
-        } catch (...) {
-            std::cerr << "Unknown exception in callback (id="
-                      << task->id << ")" << std::endl;
+
+            // после завершения callback задача больше не нужна
         }
-        lock.lock();
     }
-}
+};
